@@ -555,12 +555,20 @@ class TestHandleSetupCommand:
 
 class TestMain:
     def test_main_runs(self):
-        with patch("philips_airctrl.cli.asyncio.run") as mock_run:
+        # Close the coroutine handed to the mocked asyncio.run so it is not
+        # reported as "never awaited".
+        with patch(
+            "philips_airctrl.cli.asyncio.run", side_effect=lambda coro: coro.close()
+        ) as mock_run:
             main()
             mock_run.assert_called_once()
 
     def test_main_keyboard_interrupt(self):
-        with patch("philips_airctrl.cli.asyncio.run", side_effect=KeyboardInterrupt):
+        def _interrupt(coro):
+            coro.close()
+            raise KeyboardInterrupt
+
+        with patch("philips_airctrl.cli.asyncio.run", side_effect=_interrupt):
             main()  # Should not raise
 
 

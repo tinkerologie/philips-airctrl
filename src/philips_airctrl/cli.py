@@ -16,7 +16,6 @@ from philips_airctrl.device_info import DeviceInfoExtractor
 from philips_airctrl.discovery import DeviceDiscovery
 from philips_airctrl.setup_wizard import SetupWizard
 
-logging.basicConfig(level=logging.WARN)
 logger = logging.getLogger(__package__)
 
 
@@ -373,5 +372,7 @@ async def async_main() -> None:
 
 
 def main() -> None:
+    # Configure logging only when run as a program, never on import.
+    logging.basicConfig(level=logging.WARNING)
     with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(async_main())

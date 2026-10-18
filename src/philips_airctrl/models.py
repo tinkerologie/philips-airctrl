@@ -2,16 +2,33 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
+
+Port = Annotated[int, Field(ge=1, le=65535)]
+"""A valid TCP/UDP port number."""
+
+StatusDict = dict[str, JsonValue]
+"""A decoded device status payload (JSON object keyed by status field)."""
 
 
-class DeviceInfo(BaseModel):
+class _FrozenModel(BaseModel):
+    """Base for all library models.
+
+    Models are immutable once built (``frozen=True``) and reject unknown
+    keyword arguments (``extra="forbid"``) so typos fail loudly instead of
+    being silently dropped.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+
+class DeviceInfo(_FrozenModel):
     """Information about a discovered device."""
 
     ip: str
-    port: int = 5683
+    port: Port = 5683
     model: str | None = None
     name: str | None = None
     device_id: str | None = None
@@ -19,28 +36,28 @@ class DeviceInfo(BaseModel):
     firmware_version: str | None = None
     wifi_version: str | None = None
     serial_number: str | None = None
-    status: dict[str, Any] | None = None
+    status: StatusDict | None = None
     reachable: bool = False
 
 
-class FieldDefinition(BaseModel):
+class FieldDefinition(_FrozenModel):
     """Definition of a device status field."""
 
     name: str
-    type: str
+    type: Literal["string", "integer", "boolean"]
     description: str
 
 
-class FieldValue(BaseModel):
+class FieldValue(_FrozenModel):
     """A resolved device field with its value."""
 
-    value: Any
+    value: JsonValue
     type: str
     description: str
     raw_key: str
 
 
-class DeviceCapabilities(BaseModel):
+class DeviceCapabilities(_FrozenModel):
     """Analyzed device capabilities based on available status fields."""
 
     has_humidifier: bool = False
@@ -60,7 +77,7 @@ class DeviceCapabilities(BaseModel):
     filter_types: list[str] = Field(default_factory=list)
 
 
-class SensorConfig(BaseModel):
+class SensorConfig(_FrozenModel):
     """Home Assistant sensor configuration."""
 
     name: str
@@ -69,7 +86,7 @@ class SensorConfig(BaseModel):
     device_class: str
 
 
-class HADeviceInfo(BaseModel):
+class HADeviceInfo(_FrozenModel):
     """Home Assistant device info block."""
 
     identifiers: list[str]
@@ -80,7 +97,7 @@ class HADeviceInfo(BaseModel):
     hw_version: str
 
 
-class HAConfig(BaseModel):
+class HAConfig(_FrozenModel):
     """Home Assistant configuration suggestion."""
 
     platform: str = "philips_airpurifier"
@@ -95,17 +112,17 @@ class HAConfig(BaseModel):
     switches: list[dict[str, str]] = Field(default_factory=list)
 
 
-class ConnectionInfo(BaseModel):
+class ConnectionInfo(_FrozenModel):
     """Device connection information."""
 
     host: str
-    port: int
-    max_age: int
+    port: Port
+    max_age: Annotated[int, Field(ge=0)]
     protocol: str = "CoAP"
     encryption: str = "AES-CBC"
 
 
-class DeviceReport(BaseModel):
+class DeviceReport(_FrozenModel):
     """Comprehensive device information report."""
 
     connection: ConnectionInfo
@@ -114,6 +131,6 @@ class DeviceReport(BaseModel):
     controls: dict[str, FieldValue] = Field(default_factory=dict)
     filters: dict[str, FieldValue] = Field(default_factory=dict)
     system: dict[str, FieldValue] = Field(default_factory=dict)
-    raw_status: dict[str, Any] = Field(default_factory=dict)
+    raw_status: StatusDict = Field(default_factory=dict)
     capabilities: DeviceCapabilities = Field(default_factory=DeviceCapabilities)
     home_assistant: HAConfig | None = None
