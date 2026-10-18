@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-19
+
 ### Added
 
 - `py.typed` marker (PEP 561) and `Typing :: Typed` classifier, so type checkers use the library's annotations.
