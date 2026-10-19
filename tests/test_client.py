@@ -577,9 +577,15 @@ class TestClientNotInitialised:
 
     @pytest.mark.asyncio
     async def test_create_passes_host_and_port(self):
-        with patch.object(Client, "_init", new_callable=AsyncMock):
-            client = await Client.create(host="192.168.1.100", port=5684)
+        context = MagicMock()
+        context.shutdown = AsyncMock()
+        with patch("philips_airctrl.coap.client.Context") as mock_ctx_class:
+            mock_ctx_class.create_client_context = AsyncMock(return_value=context)
+            client = await Client.create(host="192.168.1.100", port=5684, sync=False)
+            mock_ctx_class.create_client_context.assert_awaited_once()
         assert (client.host, client.port) == ("192.168.1.100", 5684)
+        await client.shutdown()
+        context.shutdown.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_create_sync_is_keyword_only(self):
