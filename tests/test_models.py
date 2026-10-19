@@ -163,16 +163,16 @@ class TestDeviceReport:
 
 
 class TestModelConfig:
-    """All models are immutable and reject unknown fields."""
+    """Models keep the pre-1.3 mutability and extra-field behaviour (no breaking change)."""
 
-    def test_frozen(self):
+    def test_assignment_allowed(self):
         info = DeviceInfo(ip="192.168.1.1")
-        with pytest.raises(ValidationError, match="frozen"):
-            info.ip = "10.0.0.1"  # type: ignore[misc]
+        info.reachable = True
+        assert info.reachable is True
 
-    def test_extra_forbidden(self):
-        with pytest.raises(ValidationError, match="extra"):
-            DeviceInfo(ip="192.168.1.1", modle="typo")  # type: ignore[call-arg]
+    def test_extra_fields_ignored(self):
+        info = DeviceInfo(ip="192.168.1.1", unknown="value")  # type: ignore[call-arg]
+        assert not hasattr(info, "unknown")
 
     def test_model_copy_update(self):
         info = DeviceInfo(ip="192.168.1.1")

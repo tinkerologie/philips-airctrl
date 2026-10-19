@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, Field, JsonValue
 
 Port = Annotated[int, Field(ge=1, le=65535)]
 """A valid TCP/UDP port number."""
@@ -13,18 +13,7 @@ StatusDict = dict[str, JsonValue]
 """A decoded device status payload (JSON object keyed by status field)."""
 
 
-class _FrozenModel(BaseModel):
-    """Base for all library models.
-
-    Models are immutable once built (``frozen=True``) and reject unknown
-    keyword arguments (``extra="forbid"``) so typos fail loudly instead of
-    being silently dropped.
-    """
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-
-class DeviceInfo(_FrozenModel):
+class DeviceInfo(BaseModel):
     """Information about a discovered device."""
 
     ip: str
@@ -40,7 +29,7 @@ class DeviceInfo(_FrozenModel):
     reachable: bool = False
 
 
-class FieldDefinition(_FrozenModel):
+class FieldDefinition(BaseModel):
     """Definition of a device status field."""
 
     name: str
@@ -48,7 +37,7 @@ class FieldDefinition(_FrozenModel):
     description: str
 
 
-class FieldValue(_FrozenModel):
+class FieldValue(BaseModel):
     """A resolved device field with its value."""
 
     value: JsonValue
@@ -57,7 +46,7 @@ class FieldValue(_FrozenModel):
     raw_key: str
 
 
-class DeviceCapabilities(_FrozenModel):
+class DeviceCapabilities(BaseModel):
     """Analyzed device capabilities based on available status fields."""
 
     has_humidifier: bool = False
@@ -77,7 +66,7 @@ class DeviceCapabilities(_FrozenModel):
     filter_types: list[str] = Field(default_factory=list)
 
 
-class SensorConfig(_FrozenModel):
+class SensorConfig(BaseModel):
     """Home Assistant sensor configuration."""
 
     name: str
@@ -86,7 +75,7 @@ class SensorConfig(_FrozenModel):
     device_class: str
 
 
-class HADeviceInfo(_FrozenModel):
+class HADeviceInfo(BaseModel):
     """Home Assistant device info block."""
 
     identifiers: list[str]
@@ -97,7 +86,7 @@ class HADeviceInfo(_FrozenModel):
     hw_version: str
 
 
-class HAConfig(_FrozenModel):
+class HAConfig(BaseModel):
     """Home Assistant configuration suggestion."""
 
     platform: str = "philips_airpurifier"
@@ -112,7 +101,7 @@ class HAConfig(_FrozenModel):
     switches: list[dict[str, str]] = Field(default_factory=list)
 
 
-class ConnectionInfo(_FrozenModel):
+class ConnectionInfo(BaseModel):
     """Device connection information."""
 
     host: str
@@ -122,7 +111,7 @@ class ConnectionInfo(_FrozenModel):
     encryption: str = "AES-CBC"
 
 
-class DeviceReport(_FrozenModel):
+class DeviceReport(BaseModel):
     """Comprehensive device information report."""
 
     connection: ConnectionInfo
