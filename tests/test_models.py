@@ -1,5 +1,8 @@
 """Tests for the Pydantic models."""
 
+import pytest
+from pydantic import ValidationError
+
 from philips_airctrl.models import (
     ConnectionInfo,
     DeviceCapabilities,
@@ -157,3 +160,48 @@ class TestDeviceReport:
 
         json_str = report.model_dump_json()
         assert "192.168.1.1" in json_str
+
+
+class TestModelConfig:
+    """Models keep the pre-1.3 mutability and extra-field behaviour (no breaking change)."""
+
+    def test_assignment_allowed(self):
+        info = DeviceInfo(ip="192.168.1.1")
+        info.reachable = True
+        assert info.reachable is True
+
+    def test_extra_fields_ignored(self):
+        info = DeviceInfo(ip="192.168.1.1", unknown="value")  # type: ignore[call-arg]
+        assert not hasattr(info, "unknown")
+
+    def test_model_copy_update(self):
+        info = DeviceInfo(ip="192.168.1.1")
+        updated = info.model_copy(update={"reachable": True})
+        assert updated.reachable is True
+        assert info.reachable is False
+
+    @pytest.mark.parametrize("port", [0, 65536, -1])
+    def test_port_out_of_range(self, port):
+        with pytest.raises(ValidationError):
+            DeviceInfo(ip="192.168.1.1", port=port)
+        with pytest.raises(ValidationError):
+            ConnectionInfo(host="192.168.1.1", port=port, max_age=60)
+
+    def test_negative_max_age_rejected(self):
+        with pytest.raises(ValidationError):
+            ConnectionInfo(host="192.168.1.1", port=5683, max_age=-1)
+
+    def test_field_definition_type_is_constrained(self):
+        with pytest.raises(ValidationError):
+            FieldDefinition(name="x", type="float", description="x")  # type: ignore[arg-type]
+
+    def test_status_must_be_json(self):
+        with pytest.raises(ValidationError):
+            DeviceInfo(ip="192.168.1.1", status={"bad": object()})
+
+    def test_round_trip(self):
+        report = DeviceReport(
+            connection=ConnectionInfo(host="192.168.1.1", port=5683, max_age=60),
+            raw_status={"pwr": "1", "nested": {"a": [1, 2.5, None]}},
+        )
+        assert DeviceReport.model_validate_json(report.model_dump_json()) == report

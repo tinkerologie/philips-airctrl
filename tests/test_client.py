@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiocoap.error import NetworkError
 
-from philips_airctrl.coap.client import Client
+from philips_airctrl.coap.client import Client, ClientNotInitialisedError
 
 
 class TestClient:
@@ -555,3 +555,42 @@ class TestClient:
 
         with pytest.raises(NetworkError):
             await client.get_device_info()
+
+
+class TestClientNotInitialised:
+    """Requests made before the context exists fail with a clear error."""
+
+    @pytest.mark.asyncio
+    async def test_get_status_before_init_raises(self):
+        client = Client("192.168.1.100")
+        with pytest.raises(ClientNotInitialisedError, match="Client not initialised"):
+            await client.get_status()
+
+    @pytest.mark.asyncio
+    async def test_set_control_values_before_init_raises(self):
+        client = Client("192.168.1.100")
+        with pytest.raises(ClientNotInitialisedError):
+            await client.set_control_values({"pwr": "1"})
+
+    def test_error_is_runtime_error(self):
+        assert issubclass(ClientNotInitialisedError, RuntimeError)
+
+    @pytest.mark.asyncio
+    async def test_create_passes_host_and_port(self):
+        context = MagicMock()
+        context.shutdown = AsyncMock()
+        with patch("philips_airctrl.coap.client.Context") as mock_ctx_class:
+            mock_ctx_class.create_client_context = AsyncMock(return_value=context)
+            client = await Client.create(host="192.168.1.100", port=5684, sync=False)
+            mock_ctx_class.create_client_context.assert_awaited_once()
+        assert (client.host, client.port) == ("192.168.1.100", 5684)
+        await client.shutdown()
+        context.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_create_sync_is_keyword_only(self):
+        with (
+            patch.object(Client, "_init", new_callable=AsyncMock),
+            pytest.raises(TypeError),
+        ):
+            await Client.create("192.168.1.100", 5683, False)  # type: ignore[misc]

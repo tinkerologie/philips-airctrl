@@ -35,6 +35,9 @@ jobs:
       - name: Lint
         run: uv run --frozen --no-sync ruff check --output-format=github .
 
+      - name: Type check
+        run: uv run --frozen --no-sync mypy
+
   test:
     name: Test
     runs-on: ubuntu-latest

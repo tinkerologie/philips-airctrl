@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, JsonValue
+
+Port = Annotated[int, Field(ge=1, le=65535)]
+"""A valid TCP/UDP port number."""
+
+StatusDict = dict[str, JsonValue]
+"""A decoded device status payload (JSON object keyed by status field)."""
 
 
 class DeviceInfo(BaseModel):
     """Information about a discovered device."""
 
     ip: str
-    port: int = 5683
+    port: Port = 5683
     model: str | None = None
     name: str | None = None
     device_id: str | None = None
@@ -19,7 +25,7 @@ class DeviceInfo(BaseModel):
     firmware_version: str | None = None
     wifi_version: str | None = None
     serial_number: str | None = None
-    status: dict[str, Any] | None = None
+    status: StatusDict | None = None
     reachable: bool = False
 
 
@@ -27,14 +33,14 @@ class FieldDefinition(BaseModel):
     """Definition of a device status field."""
 
     name: str
-    type: str
+    type: Literal["string", "integer", "boolean"]
     description: str
 
 
 class FieldValue(BaseModel):
     """A resolved device field with its value."""
 
-    value: Any
+    value: JsonValue
     type: str
     description: str
     raw_key: str
@@ -99,8 +105,8 @@ class ConnectionInfo(BaseModel):
     """Device connection information."""
 
     host: str
-    port: int
-    max_age: int
+    port: Port
+    max_age: Annotated[int, Field(ge=0)]
     protocol: str = "CoAP"
     encryption: str = "AES-CBC"
 
@@ -114,6 +120,6 @@ class DeviceReport(BaseModel):
     controls: dict[str, FieldValue] = Field(default_factory=dict)
     filters: dict[str, FieldValue] = Field(default_factory=dict)
     system: dict[str, FieldValue] = Field(default_factory=dict)
-    raw_status: dict[str, Any] = Field(default_factory=dict)
+    raw_status: StatusDict = Field(default_factory=dict)
     capabilities: DeviceCapabilities = Field(default_factory=DeviceCapabilities)
     home_assistant: HAConfig | None = None

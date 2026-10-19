@@ -23,6 +23,7 @@ classifiers = [
     "Topic :: Home Automation",
     "Topic :: Internet :: WWW/HTTP",
     "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
 ]
 keywords = [
     "philips",
@@ -42,7 +43,7 @@ dependencies = [
     "tabulate>=0.9.0",
     "pyyaml>=6.0",
     "click>=8.0.0",
-    "pydantic>=2.0.0",
+    "pydantic>=2.11.0",
 ]
 
 [project.optional-dependencies]
@@ -54,6 +55,9 @@ dev = [
     "pytest-cov>=6.0.0",
     "pre-commit>=4.0.0",
     "bandit[toml]>=1.7.0",
+    "types-netifaces>=0.11.0",
+    "types-PyYAML>=6.0",
+    "types-tabulate>=0.9.0",
 ]
 
 [project.urls]
@@ -110,12 +114,20 @@ exclude_dirs = ["tests"]
 
 [tool.mypy]
 python_version = "3.11"
+files = ["src"]
+plugins = ["pydantic.mypy"]
+strict = true
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
 check_untyped_defs = true
 strict_equality = true
+
+[[tool.mypy.overrides]]
+# aiocoap ships no type information (no py.typed marker or stubs).
+module = ["aiocoap", "aiocoap.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 minversion = "8.0"

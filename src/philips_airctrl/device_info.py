@@ -670,38 +670,45 @@ class DeviceInfoExtractor:
         try:
             status, max_age = await client.get_status(observe=False)
 
-            report = DeviceReport(
-                connection=ConnectionInfo(
-                    host=self.host,
-                    port=self.port,
-                    max_age=max_age,
-                ),
-                raw_status=status,
-                capabilities=analyze_capabilities(status),
-                home_assistant=generate_ha_config(self.host, status),
-            )
-
+            categories: dict[str, dict[str, FieldValue]] = {
+                "device": {},
+                "sensors": {},
+                "controls": {},
+                "filters": {},
+                "system": {},
+            }
             for key, value in status.items():
                 if key in DEVICE_FIELDS:
                     field_def = DEVICE_FIELDS[key]
-                    category = get_field_category(key)
-                    field_value = FieldValue(
+                    categories[get_field_category(key)][field_def.name] = FieldValue(
                         value=value,
                         type=field_def.type,
                         description=field_def.description,
                         raw_key=key,
                     )
-                    getattr(report, category)[field_def.name] = field_value
                 else:
-                    field_value = FieldValue(
+                    categories["system"][key] = FieldValue(
                         value=value,
                         type=type(value).__name__,
                         description="Unknown field",
                         raw_key=key,
                     )
-                    report.system[key] = field_value
 
-            return report
+            return DeviceReport(
+                connection=ConnectionInfo(
+                    host=self.host,
+                    port=self.port,
+                    max_age=max_age,
+                ),
+                device=categories["device"],
+                sensors=categories["sensors"],
+                controls=categories["controls"],
+                filters=categories["filters"],
+                system=categories["system"],
+                raw_status=status,
+                capabilities=analyze_capabilities(status),
+                home_assistant=generate_ha_config(self.host, status),
+            )
 
         finally:
             await client.shutdown()
@@ -714,6 +721,8 @@ class DeviceInfoExtractor:
 
     def export_yaml(self, device_info: DeviceReport) -> str:
         """Export device info as YAML."""
-        return yaml.dump(
-            device_info.model_dump(mode="json"), default_flow_style=False, sort_keys=False
+        return yaml.safe_dump(
+            device_info.model_dump(mode="json"),
+            default_flow_style=False,
+            sort_keys=False,
         )

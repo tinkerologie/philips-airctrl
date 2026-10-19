@@ -363,3 +363,35 @@ class TestGenerateSummaryReport:
         assert "SENSORS" in report
         assert "CONTROLS" in report
         assert "HOME ASSISTANT INTEGRATION" in report
+
+
+class TestRequireState:
+    """Steps that run out of order fail with a clear error, not AttributeError."""
+
+    def test_require_device_raises_without_selection(self):
+        with pytest.raises(RuntimeError, match="No device selected"):
+            SetupWizard()._require_device()
+
+    def test_require_report_raises_without_info(self):
+        wizard = SetupWizard()
+        wizard.selected_device = _make_device()
+        with pytest.raises(RuntimeError, match="No device information gathered"):
+            wizard._require_report()
+
+
+class TestConfigurationStepEdgeCases:
+    @pytest.mark.asyncio
+    async def test_unnamed_device_without_ha_config(self, tmp_path):
+        wizard = SetupWizard()
+        wizard.selected_device = DeviceInfo(ip="192.168.1.50")
+        wizard.device_info = _make_report().model_copy(update={"home_assistant": None})
+
+        with (
+            patch("philips_airctrl.setup_wizard.click"),
+            patch("philips_airctrl.setup_wizard.Path") as mock_path_class,
+        ):
+            mock_path_class.home.return_value = tmp_path
+            await wizard._configuration_step()
+
+        yaml_file = tmp_path / "philips_airpurifier_config" / "192.168.1.50_ha_config.yaml"
+        assert yaml_file.read_text() == "air_purifier: {}\n"

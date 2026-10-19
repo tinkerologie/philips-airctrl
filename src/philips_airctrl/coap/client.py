@@ -6,10 +6,11 @@ import asyncio
 import json
 import logging
 import os
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Self, cast
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
+    from types import TracebackType
 
 from aiocoap import Context, Message, Unreliable
 from aiocoap.error import NetworkError
@@ -20,6 +21,15 @@ from philips_airctrl.coap.encryption import EncryptionContext
 logger = logging.getLogger(__name__)
 
 RETRY_DELAY = 0.5
+
+
+class ClientNotInitialisedError(RuntimeError):
+    """Raised when a request is made before the client context is created."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Client not initialised; use 'await Client.create(...)' or 'async with Client(...)'"
+        )
 
 
 class Client:
@@ -40,14 +50,34 @@ class Client:
         if sync:
             await self._sync()
 
+    @property
+    def _context(self) -> Context:
+        if self._client_context is None:
+            raise ClientNotInitialisedError
+        return self._client_context
+
+    @property
+    def _encryption(self) -> EncryptionContext:
+        if self._encryption_context is None:
+            raise ClientNotInitialisedError
+        return self._encryption_context
+
     @classmethod
-    async def create(cls, *args: Any, **kwargs: Any) -> Client:
-        sync = kwargs.pop("sync", True)
-        obj = cls(*args, **kwargs)
+    async def create(cls, host: str, port: int = 5683, *, sync: bool = True) -> Self:
+        """Create a client and its CoAP context.
+
+        Args:
+            host: Device address.
+            port: Device CoAP port.
+            sync: When ``True`` (the default), perform the encrypted sync
+                handshake. Pass ``False`` to only read plaintext resources
+                such as ``/sys/dev/info``.
+        """
+        obj = cls(host, port)
         await obj._init(sync=sync)
         return obj
 
-    async def __aenter__(self) -> Client:
+    async def __aenter__(self) -> Self:
         await self._init()
         return self
 
@@ -55,7 +85,7 @@ class Client:
         self,
         exc_type: type[BaseException] | None,
         exc_val: BaseException | None,
-        exc_tb: Any,
+        exc_tb: TracebackType | None,
     ) -> None:
         await self.shutdown()
 
@@ -72,10 +102,10 @@ class Client:
             uri=f"coap://{self.host}:{self.port}{self.SYNC_PATH}",
             payload=sync_request.encode(),
         )
-        response = await self._client_context.request(request).response
+        response = await self._context.request(request).response
         client_key = response.payload.decode()
         logger.debug("synced: %s", client_key)
-        self._encryption_context.set_client_key(client_key)
+        self._encryption.set_client_key(client_key)
 
     async def get_status(self, observe: bool = True) -> tuple[dict[str, Any], int]:
         """Fetch the device status once.
@@ -104,7 +134,7 @@ class Client:
             uri=f"coap://{self.host}:{self.port}{self.STATUS_PATH}",
         )
         request.opt.observe = 0
-        requester = self._client_context.request(request)
+        requester = self._context.request(request)
         try:
             response = await requester.response
         except NetworkError:
@@ -116,7 +146,7 @@ class Client:
             logger.debug("cancelling one-shot observation")
             requester.observation.cancel()
         payload_encrypted = response.payload.decode()
-        payload = self._encryption_context.decrypt(payload_encrypted)
+        payload = self._encryption.decrypt(payload_encrypted)
         logger.debug("status: %s", payload)
         state_reported = json.loads(payload)
         max_age = 60
@@ -125,15 +155,15 @@ class Client:
             logger.debug("max age = %s", max_age)
         except AttributeError:
             logger.debug("no max age found in CoAP options")
-        return state_reported["state"]["reported"], max_age
+        return cast("dict[str, Any]", state_reported["state"]["reported"]), max_age
 
     async def observe_status(self) -> AsyncIterator[dict[str, Any]]:
         def decrypt_status(response: Any) -> dict[str, Any]:
             payload_encrypted = response.payload.decode()
-            payload = self._encryption_context.decrypt(payload_encrypted)
+            payload = self._encryption.decrypt(payload_encrypted)
             logger.debug("observation status: %s", payload)
             status = json.loads(payload)
-            return status["state"]["reported"]
+            return cast("dict[str, Any]", status["state"]["reported"])
 
         logger.debug("observing status")
         request = Message(
@@ -142,7 +172,7 @@ class Client:
             uri=f"coap://{self.host}:{self.port}{self.STATUS_PATH}",
         )
         request.opt.observe = 0
-        requester = self._client_context.request(request)
+        requester = self._context.request(request)
         response = await requester.response
         yield decrypt_status(response)
         async for response in requester.observation:
@@ -170,7 +200,7 @@ class Client:
         }
         payload = json.dumps(state_desired)
         logger.debug("REQUEST: %s", payload)
-        payload_encrypted = self._encryption_context.encrypt(payload)
+        payload_encrypted = self._encryption.encrypt(payload)
 
         for attempt in range(retry_count + 1):
             request = Message(
@@ -179,7 +209,7 @@ class Client:
                 uri=f"coap://{self.host}:{self.port}{self.CONTROL_PATH}",
                 payload=payload_encrypted.encode(),
             )
-            response = await self._client_context.request(request).response
+            response = await self._context.request(request).response
             logger.debug("RESPONSE: %s", response.payload)
             result = json.loads(response.payload)
             if result.get("status") == "success":
@@ -215,7 +245,7 @@ class Client:
             transport_tuning=Unreliable,
             uri=f"coap://{self.host}:{self.port}{self.INFO_PATH}",
         )
-        requester = self._client_context.request(request)
+        requester = self._context.request(request)
         try:
             response = await requester.response
         except NetworkError:
