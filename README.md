@@ -2,7 +2,6 @@
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Code style: ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 ![Tests](https://img.shields.io/badge/coverage-100%25-brightgreen.svg)
 
 Async Python library and CLI for controlling Philips air purifiers over encrypted CoAP. Includes network discovery, device data extraction, and an interactive setup wizard for collecting device information to help expand Home Assistant integration support.
