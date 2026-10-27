@@ -39,8 +39,13 @@ jobs:
         run: uv run --frozen --no-sync mypy
 
   test:
-    name: Test
+    name: Test (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every supported release, from the requires-python floor to the latest.
+        python-version: ["3.11", "3.12", "3.13", "3.14", "3.15"]
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -49,8 +54,11 @@ jobs:
 
       - name: Set up uv
         uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
         run: uv sync --locked --extra dev
+      # Deprecations fail the run, so removals in newer Pythons surface early.
       - name: Run tests
-        run: uv run --frozen --no-sync pytest
+        run: uv run --frozen --no-sync python -W error::DeprecationWarning -W error::PendingDeprecationWarning -m pytest

@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-28
+
+### Fixed
+
+- `observe_status()` no longer goes silent after a few minutes while the device stays reachable ([#34](https://github.com/tinkerologie/philips-airctrl/issues/34)). It now renews its Observe registration every Max-Age seconds of the latest registration response (RFC 7641 §3.3.1), on the same encryption session without a new sync. The replaced observation is cancelled once the new one has answered, and a renewal's first status is only yielded when it differs from the last one. A renewal that fails raises `NetworkError`, or `TimeoutError` after 10 seconds, so callers can reconnect. The observation is cancelled on every exit path (`break`, `aclose()`, cancellation, errors and the end of the stream).
+- `get_status(observe=False)` and `observe_status()` no longer cancel an observation that aiocoap has already ended (after an error, or when the device answers without Observe). aiocoap rejects a second cancel with an `AssertionError`, which hid the original `NetworkError`.
+
+### Added
+
+- `observe_status(renew_interval=...)` keyword to override the renewal interval.
+- Python 3.14 and 3.15 classifiers. CI runs the test suite on every supported Python from 3.11 to 3.15, with deprecation warnings treated as errors.
+
+### Changed
+
+- `get_status()` falls back to a Max-Age of 60 for a missing, non-integer or non-positive value, using the same rule as observation renewal.
+- pytest-asyncio's fixture loop scope is set explicitly (`asyncio_default_fixture_loop_scope = "function"`), removing a deprecation warning.
+- Package metadata uses a PEP 639 SPDX license expression (`license = "Apache-2.0"` with `license-files`) instead of the deprecated license table and `License ::` classifier; the build requires hatchling 1.27 or newer.
+- On Python 3.15 and newer the minimum pydantic is 2.14.0, the first release with Python 3.15 wheels. Older Pythons keep the 2.11.0 floor, so Home Assistant 2026.10 (pydantic 2.13.5) is unaffected.
+
+### Removed
+
+- The Aikido security-scan agent instructions (`.github/instructions/aikido_rules.instructions.md`); the service is no longer used.
+
 ## [1.3.0] - 2026-10-19
 
 ### Added

@@ -1,12 +1,92 @@
 """Tests for the CoAP client module."""
 
+import asyncio
 import json
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiocoap.error import NetworkError
 
+from philips_airctrl.coap import client as client_module
 from philips_airctrl.coap.client import Client, ClientNotInitialisedError
+
+
+class FakeObservation:
+    """Stand-in for aiocoap's ClientObservation with its cancellation rules.
+
+    Iteration blocks until a response or error is pushed and ends on demand.
+    Like aiocoap 0.4.17, an error or the device ending the observation marks it
+    cancelled, and cancelling twice fails. Only explicit ``cancel()`` calls
+    from the client are recorded on the ``cancel`` mock.
+    """
+
+    _END = object()
+
+    def __init__(self) -> None:
+        self._queue: asyncio.Queue[Any] = asyncio.Queue()
+        self.cancelled = False
+        self.cancel = MagicMock(side_effect=self._cancel)
+
+    def _cancel(self) -> None:
+        assert not self.cancelled, "ClientObservation cancelled twice"
+        self.cancelled = True
+
+    def push(self, item: Any) -> None:
+        if isinstance(item, BaseException):
+            # aiocoap's ClientObservation.error() cancels the observation itself.
+            self.cancelled = True
+        self._queue.put_nowait(item)
+
+    def end(self) -> None:
+        self.cancelled = True
+        self._queue.put_nowait(self._END)
+
+    def __aiter__(self) -> "FakeObservation":
+        return self
+
+    async def __anext__(self) -> Any:
+        item = await self._queue.get()
+        if item is self._END:
+            raise StopAsyncIteration
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+def _response(reported: str, max_age: Any = 60) -> MagicMock:
+    """Build a response whose payload "decrypts" to the given reported state."""
+    response = MagicMock()
+    response.payload.decode.return_value = f'{{"state": {{"reported": {reported}}}}}'
+    response.opt.max_age = max_age
+    return response
+
+
+def _requester(reported: str | None = None, *, max_age: Any = 60, error: Any = None) -> MagicMock:
+    """Build a requester with a FakeObservation and an awaitable first response."""
+    requester = MagicMock()
+    requester.observation = FakeObservation()
+
+    async def first_response() -> Any:
+        if error is not None:
+            raise error
+        if reported is None:
+            await asyncio.Event().wait()
+        return _response(reported, max_age)
+
+    requester.response = first_response()
+    return requester
+
+
+def _observing_client() -> tuple[Client, MagicMock, MagicMock]:
+    """Return a client whose context and encryption are mocks (identity decrypt)."""
+    client = Client("192.168.1.100")
+    context = MagicMock()
+    encryption = MagicMock()
+    encryption.decrypt.side_effect = lambda payload: payload
+    client._client_context = context
+    client._encryption_context = encryption
+    return client, context, encryption
 
 
 class TestClient:
@@ -141,6 +221,7 @@ class TestClient:
         mock_response.opt.max_age = 120
 
         mock_requester = MagicMock()
+        mock_requester.observation.cancelled = False
 
         async def mock_response_coro():
             return mock_response
@@ -167,6 +248,19 @@ class TestClient:
         mock_encryption.decrypt.assert_called_once_with("encrypted_payload")
         assert status == {"power": True, "mode": "auto"}
         assert max_age == 120
+
+    @pytest.mark.asyncio
+    async def test_get_status_without_observe_skips_an_observation_already_ended(self):
+        client, context, _ = _observing_client()
+        requester = _requester('{"power": true}')
+        # The device answered without Observe, so aiocoap already ended it.
+        requester.observation.end()
+        context.request.return_value = requester
+
+        status, _ = await client.get_status(observe=False)
+
+        assert status == {"power": True}
+        requester.observation.cancel.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_get_status_no_max_age(self):
@@ -393,45 +487,17 @@ class TestClient:
 
     @pytest.mark.asyncio
     async def test_observe_status(self):
-        client = Client("192.168.1.100")
+        client, context, _ = _observing_client()
+        first = _requester('{"power": true}')
+        context.request.side_effect = [first]
+        first.observation.push(_response('{"power": false}'))
+        first.observation.end()
 
-        mock_context = MagicMock()
-        mock_encryption = MagicMock()
+        results = [status async for status in client.observe_status()]
 
-        initial_response = MagicMock()
-        initial_response.payload.decode.return_value = "enc1"
-
-        obs_response = MagicMock()
-        obs_response.payload.decode.return_value = "enc2"
-
-        mock_encryption.decrypt.side_effect = [
-            '{"state": {"reported": {"power": true}}}',
-            '{"state": {"reported": {"power": false}}}',
-        ]
-
-        mock_requester = MagicMock()
-
-        async def mock_response_coro():
-            return initial_response
-
-        mock_requester.response = mock_response_coro()
-
-        async def mock_observation():
-            yield obs_response
-
-        mock_requester.observation = mock_observation()
-        mock_context.request.return_value = mock_requester
-
-        client._client_context = mock_context
-        client._encryption_context = mock_encryption
-
-        results = []
-        async for status in client.observe_status():
-            results.append(status)
-
-        assert len(results) == 2
-        assert results[0] == {"power": True}
-        assert results[1] == {"power": False}
+        assert results == [{"power": True}, {"power": False}]
+        # The device ended the observation, so the client must not cancel it again.
+        first.observation.cancel.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_init_method(self):
@@ -594,3 +660,191 @@ class TestClientNotInitialised:
             pytest.raises(TypeError),
         ):
             await Client.create("192.168.1.100", 5683, False)  # type: ignore[misc]
+
+
+class TestObserveStatusRenewal:
+    """Observe renewal and cleanup for issue #34."""
+
+    @pytest.mark.asyncio
+    async def test_renews_on_the_same_session_and_cancels_the_old_observation(self):
+        client, context, _ = _observing_client()
+        first = _requester('{"power": true}')
+        second = _requester('{"power": false}')
+        context.request.side_effect = [first, second]
+        second.observation.push(_response('{"power": true}'))
+
+        with patch.object(client, "_sync", new_callable=AsyncMock) as sync:
+            stream = client.observe_status(renew_interval=0.01)
+            results = [await anext(stream) for _ in range(3)]
+            await stream.aclose()
+
+        assert results == [{"power": True}, {"power": False}, {"power": True}]
+        assert context.request.call_count == 2
+        assert all(c.args[0].opt.observe == 0 for c in context.request.call_args_list)
+        first.observation.cancel.assert_called_once_with()
+        second.observation.cancel.assert_called_once_with()
+        sync.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_default_interval_follows_max_age(self):
+        client, context, _ = _observing_client()
+        first = _requester('{"power": true}', max_age=1)
+        second = _requester('{"power": false}')
+        context.request.side_effect = [first, second]
+        loop = asyncio.get_running_loop()
+
+        stream = client.observe_status()
+        await anext(stream)
+        started = loop.time()
+        assert await anext(stream) == {"power": False}
+        await stream.aclose()
+
+        assert 0.9 <= loop.time() - started < 5
+        first.observation.cancel.assert_called_once_with()
+
+    @pytest.mark.parametrize(
+        ("max_age", "expected"),
+        [(30, 30), (None, 60), (0, 60), (-5, 60), (True, 60), ("60", 60)],
+    )
+    def test_max_age_falls_back_for_unusable_values(self, max_age, expected):
+        assert Client._max_age(_response("{}", max_age)) == expected
+
+    def test_max_age_falls_back_when_the_option_is_missing(self):
+        response = MagicMock()
+        response.opt = object()
+        assert Client._max_age(response) == 60
+
+    @pytest.mark.asyncio
+    async def test_renewal_with_an_unchanged_status_is_not_yielded(self):
+        client, context, _ = _observing_client()
+        first = _requester('{"power": true}')
+        second = _requester('{"power": true}')
+        context.request.side_effect = [first, second]
+        second.observation.push(_response('{"power": false}'))
+
+        stream = client.observe_status(renew_interval=0.01)
+        results = [await anext(stream) for _ in range(2)]
+        await stream.aclose()
+
+        assert results == [{"power": True}, {"power": False}]
+        assert context.request.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_failed_renewal_raises_and_cancels_both_observations(self):
+        client, context, _ = _observing_client()
+        first = _requester('{"power": true}')
+        second = _requester(error=NetworkError("unreachable"))
+        context.request.side_effect = [first, second]
+
+        stream = client.observe_status(renew_interval=0.01)
+        await anext(stream)
+        with pytest.raises(NetworkError):
+            await anext(stream)
+
+        first.observation.cancel.assert_called_once_with()
+        second.observation.cancel.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_renewal_that_never_answers_times_out(self):
+        client, context, _ = _observing_client()
+        first = _requester('{"power": true}')
+        second = _requester(None)
+        context.request.side_effect = [first, second]
+
+        with patch.object(client_module, "RENEWAL_TIMEOUT", 0.01):
+            stream = client.observe_status(renew_interval=0.01)
+            await anext(stream)
+            with pytest.raises(TimeoutError):
+                await anext(stream)
+
+        first.observation.cancel.assert_called_once_with()
+        second.observation.cancel.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_timeout_from_the_observation_itself_propagates(self):
+        client, context, _ = _observing_client()
+        first = _requester('{"power": true}')
+        context.request.side_effect = [first]
+        first.observation.push(TimeoutError("transport timeout"))
+
+        stream = client.observe_status(renew_interval=60)
+        await anext(stream)
+        with pytest.raises(TimeoutError, match="transport timeout"):
+            await anext(stream)
+
+        assert context.request.call_count == 1
+        # aiocoap ended the observation with the error; no second cancel.
+        first.observation.cancel.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_early_break_cancels_once(self):
+        client, context, _ = _observing_client()
+        first = _requester('{"power": true}')
+        context.request.side_effect = [first]
+
+        stream = client.observe_status()
+        async for _ in stream:
+            break
+        await stream.aclose()
+
+        first.observation.cancel.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_failed_initial_response_cancels_once(self, caplog):
+        client, context, _ = _observing_client()
+        first = _requester(error=NetworkError("unreachable"))
+        context.request.side_effect = [first]
+
+        with pytest.raises(NetworkError):
+            await anext(client.observe_status())
+
+        first.observation.cancel.assert_called_once_with()
+        assert "network error while observing status" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_decryption_error_cancels_once(self):
+        client, context, encryption = _observing_client()
+        first = _requester('{"power": true}')
+        context.request.side_effect = [first]
+        encryption.decrypt.side_effect = ValueError("bad padding")
+
+        with pytest.raises(ValueError, match="bad padding"):
+            await anext(client.observe_status())
+
+        first.observation.cancel.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_rejects_a_non_positive_renew_interval(self):
+        client, _, _ = _observing_client()
+        with pytest.raises(ValueError, match="renew_interval"):
+            await anext(client.observe_status(renew_interval=0))
+
+    @pytest.mark.asyncio
+    async def test_device_ending_a_renewal_does_not_cancel_twice(self):
+        client, context, _ = _observing_client()
+        first = _requester('{"power": true}')
+        second = _requester('{"power": false}')
+        context.request.side_effect = [first, second]
+        second.observation.end()
+
+        stream = client.observe_status(renew_interval=0.01)
+        results = [status async for status in stream]
+
+        assert results == [{"power": True}, {"power": False}]
+        first.observation.cancel.assert_called_once_with()
+        second.observation.cancel.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_network_error_on_the_observation_propagates(self):
+        client, context, _ = _observing_client()
+        first = _requester('{"power": true}')
+        context.request.side_effect = [first]
+        first.observation.push(NetworkError("link lost"))
+
+        stream = client.observe_status(renew_interval=60)
+        await anext(stream)
+        # Callers rely on NetworkError (not an AssertionError) to reconnect.
+        with pytest.raises(NetworkError):
+            await anext(stream)
+
+        first.observation.cancel.assert_not_called()

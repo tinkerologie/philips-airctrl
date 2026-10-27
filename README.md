@@ -141,7 +141,9 @@ async def main():
         # Set controls
         await client.set_control_values(data={"power": True, "mode": "auto"})
 
-        # Observe real-time updates
+        # Observe real-time updates. The Observe registration is renewed every
+        # Max-Age seconds (or renew_interval=...) so the stream stays alive; a
+        # renewal that fails raises NetworkError or TimeoutError.
         async for update in client.observe_status():
             print(update)
             break
