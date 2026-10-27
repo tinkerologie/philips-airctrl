@@ -301,7 +301,7 @@ philips-airctrl -D status -H 192.168.1.100
 
 ## License
 
-MIT -- see [LICENSE](LICENSE).
+Apache License -- see [LICENSE](LICENSE).
 
 ## Acknowledgments
 
