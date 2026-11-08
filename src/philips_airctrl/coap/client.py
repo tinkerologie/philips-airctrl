@@ -30,7 +30,7 @@ RENEWAL_TIMEOUT = 10.0
 
 
 class ClientNotInitialisedError(RuntimeError):
-    """Raised when a request is made before the client context is created."""
+    """Raised when a request is made before the client context exists or after ``shutdown()``."""
 
     def __init__(self) -> None:
         super().__init__(
@@ -96,8 +96,17 @@ class Client:
         await self.shutdown()
 
     async def shutdown(self) -> None:
-        if self._client_context:
-            await self._client_context.shutdown()
+        """Shut down the CoAP context.
+
+        Repeated and concurrent calls are no-ops: the reference is cleared before
+        awaiting, so the same aiocoap ``Context`` is never shut down twice (aiocoap
+        raises ``AttributeError`` on a second ``Context.shutdown()``). A concurrent
+        caller returns without waiting for a shutdown already in progress. New
+        requests after shutdown raise ``ClientNotInitialisedError``.
+        """
+        context, self._client_context = self._client_context, None
+        if context is not None:
+            await context.shutdown()
 
     async def _sync(self) -> None:
         logger.debug("syncing")
