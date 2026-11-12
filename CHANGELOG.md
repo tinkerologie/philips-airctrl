@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-11-12
+
 ### Fixed
 
 - `CoAPClient.shutdown()` is now idempotent and safe to call concurrently ([#36](https://github.com/tinkerologie/philips-airctrl/issues/36)). The aiocoap context is torn down once, in a task the client owns, and every caller awaits that same teardown, so a second call no longer shuts down the same context again, which aiocoap rejects with `AttributeError: 'NoneType' object has no attribute 'values'`. Cancelling a caller no longer interrupts the teardown: it still finishes, and a `shutdown()` call made meanwhile awaits it. Once the teardown has finished, further calls are no-ops, also after a failed teardown. A new request after shutdown now raises `ClientNotInitialisedError` instead of aiocoap's `LibraryShutdown`.
