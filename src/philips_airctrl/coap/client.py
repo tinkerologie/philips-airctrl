@@ -30,11 +30,12 @@ RENEWAL_TIMEOUT = 10.0
 
 
 class ClientNotInitialisedError(RuntimeError):
-    """Raised when a request is made before the client context is created."""
+    """Raised when a request is made before the client context exists or after ``shutdown()``."""
 
     def __init__(self) -> None:
         super().__init__(
-            "Client not initialised; use 'await Client.create(...)' or 'async with Client(...)'"
+            "Client not initialised or already shut down; "
+            "use 'await Client.create(...)' or 'async with Client(...)'"
         )
 
 
@@ -49,6 +50,11 @@ class Client:
         self.port = port
         self._client_context: Context | None = None
         self._encryption_context: EncryptionContext | None = None
+        # The teardown in flight, if any, and every pending teardown: asyncio
+        # only keeps weak references to tasks, so a teardown replaced by a
+        # re-initialised client's one must stay referenced until it finishes.
+        self._shutdown_task: asyncio.Task[None] | None = None
+        self._pending_shutdowns: set[asyncio.Task[None]] = set()
 
     async def _init(self, sync: bool = True) -> None:
         self._client_context = await Context.create_client_context()
@@ -96,8 +102,38 @@ class Client:
         await self.shutdown()
 
     async def shutdown(self) -> None:
-        if self._client_context:
-            await self._client_context.shutdown()
+        """Shut down the CoAP context.
+
+        Safe to call repeatedly and concurrently: the context is detached and its
+        teardown runs once, in a task owned by the client, so the same aiocoap
+        ``Context`` is never shut down twice (aiocoap raises ``AttributeError`` on
+        a second ``Context.shutdown()``, and a cancelled one is left half torn
+        down). Every caller that arrives while the teardown runs awaits it and
+        receives its error, if any. Cancelling a caller propagates to that caller
+        only; the teardown keeps running. Once it has finished, further calls are
+        no-ops. New requests after shutdown raise ``ClientNotInitialisedError``.
+        """
+        context, self._client_context = self._client_context, None
+        if context is not None:
+            started = asyncio.create_task(context.shutdown())
+            self._shutdown_task = started
+            self._pending_shutdowns.add(started)
+            started.add_done_callback(self._shutdown_done)
+        in_flight = self._shutdown_task
+        if in_flight is not None and not in_flight.done():
+            await asyncio.shield(in_flight)
+
+    def _shutdown_done(self, task: asyncio.Task[None]) -> None:
+        """Release a finished teardown and retrieve its error.
+
+        Retrieving the error keeps asyncio from reporting it as never retrieved
+        when every caller was cancelled before the teardown finished.
+        """
+        self._pending_shutdowns.discard(task)
+        if self._shutdown_task is task:
+            self._shutdown_task = None
+        if not task.cancelled() and (exc := task.exception()) is not None:
+            logger.debug("CoAP context shutdown failed: %r", exc)
 
     async def _sync(self) -> None:
         logger.debug("syncing")

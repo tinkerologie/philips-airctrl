@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -89,6 +90,22 @@ def _observing_client() -> tuple[Client, MagicMock, MagicMock]:
     return client, context, encryption
 
 
+def _once_only_context() -> AsyncMock:
+    """Context mock that raises aiocoap 0.4.17's AttributeError on a second shutdown."""
+    context = AsyncMock()
+    calls = 0
+
+    async def _shutdown() -> None:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise AttributeError("'NoneType' object has no attribute 'values'")
+        await asyncio.sleep(0)
+
+    context.shutdown.side_effect = _shutdown
+    return context
+
+
 class TestClient:
     def test_init(self):
         client = Client("192.168.1.100", 5683)
@@ -122,9 +139,11 @@ class TestClient:
                 assert isinstance(client, Client)
                 mock_init.assert_called_once()
                 # Set up a mock context so shutdown works
-                client._client_context = AsyncMock()
+                mock_context = AsyncMock()
+                client._client_context = mock_context
 
-            client._client_context.shutdown.assert_called_once()
+            mock_context.shutdown.assert_awaited_once()
+            assert client._client_context is None
 
     @pytest.mark.asyncio
     async def test_async_context_manager_no_context(self):
@@ -139,12 +158,189 @@ class TestClient:
         client._client_context = mock_context
 
         await client.shutdown()
-        mock_context.shutdown.assert_called_once()
+        mock_context.shutdown.assert_awaited_once()
+        assert client._client_context is None
+
+    @pytest.mark.asyncio
+    async def test_shutdown_twice_is_noop(self):
+        client = Client("192.168.1.100")
+        mock_context = _once_only_context()
+        client._client_context = mock_context
+
+        await client.shutdown()
+        await client.shutdown()
+
+        mock_context.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_shutdown_is_noop(self):
+        client = Client("192.168.1.100")
+        mock_context = _once_only_context()
+        client._client_context = mock_context
+
+        await asyncio.gather(client.shutdown(), client.shutdown())
+
+        mock_context.shutdown.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_shutdown_no_context(self):
         client = Client("192.168.1.100")
         await client.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_shutdown_finishes_and_is_awaited_again(self):
+        client = Client("192.168.1.100")
+        context = AsyncMock()
+        started, release = asyncio.Event(), asyncio.Event()
+        finished = False
+
+        async def _blocking_shutdown() -> None:
+            nonlocal finished
+            started.set()
+            await release.wait()
+            finished = True
+
+        context.shutdown.side_effect = _blocking_shutdown
+        client._client_context = context
+
+        first = asyncio.create_task(client.shutdown())
+        await started.wait()
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert not finished
+
+        events: list[str] = []
+
+        async def _second_caller() -> None:
+            await client.shutdown()
+            events.append("second returned" if finished else "second returned early")
+
+        second = asyncio.create_task(_second_caller())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not second.done()  # waits for the in-flight teardown
+        release.set()
+        await second
+
+        assert finished
+        assert events == ["second returned"]
+        context.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_shutdown_waits_for_teardown(self):
+        client = Client("192.168.1.100")
+        context = AsyncMock()
+        release = asyncio.Event()
+        context.shutdown.side_effect = release.wait
+        client._client_context = context
+
+        callers = [asyncio.create_task(client.shutdown()) for _ in range(2)]
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not any(c.done() for c in callers)
+        release.set()
+        await asyncio.gather(*callers)
+
+        context.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_error_reaches_waiting_callers_then_noop(self):
+        client = Client("192.168.1.100")
+        context = AsyncMock()
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def _failing_shutdown() -> None:
+            started.set()
+            await release.wait()
+            raise OSError("boom")
+
+        context.shutdown.side_effect = _failing_shutdown
+        client._client_context = context
+
+        callers = [asyncio.create_task(client.shutdown()) for _ in range(2)]
+        await started.wait()
+        release.set()
+        results = await asyncio.gather(*callers, return_exceptions=True)
+
+        assert [type(r) for r in results] == [OSError, OSError]
+        await client.shutdown()  # finished teardown: no-op, error not re-raised
+        context.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_error_after_cancel_is_retrieved(self, caplog):
+        client = Client("192.168.1.100")
+        context = AsyncMock()
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def _failing_shutdown() -> None:
+            started.set()
+            await release.wait()
+            raise OSError("boom")
+
+        context.shutdown.side_effect = _failing_shutdown
+        client._client_context = context
+
+        caller = asyncio.create_task(client.shutdown())
+        await started.wait()
+        teardown = client._shutdown_task
+        assert teardown is not None
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        with caplog.at_level(logging.DEBUG, logger="philips_airctrl.coap.client"):
+            release.set()
+            await asyncio.wait({teardown})
+
+        assert "CoAP context shutdown failed" in caplog.text
+        assert not client._pending_shutdowns
+        await client.shutdown()  # no-op, the logged error is not re-raised
+        context.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_after_reinit_tears_down_new_context(self):
+        client = Client("192.168.1.100")
+        old, new = AsyncMock(), AsyncMock()
+        client._client_context = old
+        await client.shutdown()
+
+        client._client_context = new
+        await client.shutdown()
+
+        old.shutdown.assert_awaited_once()
+        new.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_reinit_during_teardown_keeps_old_teardown_referenced(self):
+        client = Client("192.168.1.100")
+        old, new = AsyncMock(), AsyncMock()
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def _blocking_shutdown() -> None:
+            started.set()
+            await release.wait()
+
+        old.shutdown.side_effect = _blocking_shutdown
+        client._client_context = old
+
+        first = asyncio.create_task(client.shutdown())
+        await started.wait()
+        old_teardown = client._shutdown_task
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        client._client_context = new  # re-initialised before the old teardown ended
+        await client.shutdown()
+        assert client._pending_shutdowns == {old_teardown}
+
+        release.set()
+        assert old_teardown is not None
+        await asyncio.wait({old_teardown})
+
+        assert not client._pending_shutdowns
+        old.shutdown.assert_awaited_once()
+        new.shutdown.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_sync(self):
@@ -624,7 +820,7 @@ class TestClient:
 
 
 class TestClientNotInitialised:
-    """Requests made before the context exists fail with a clear error."""
+    """Requests made before the context exists or after shutdown() fail with a clear error."""
 
     @pytest.mark.asyncio
     async def test_get_status_before_init_raises(self):
@@ -640,6 +836,22 @@ class TestClientNotInitialised:
 
     def test_error_is_runtime_error(self):
         assert issubclass(ClientNotInitialisedError, RuntimeError)
+
+    @pytest.mark.asyncio
+    async def test_requests_after_shutdown_raise(self):
+        client, context, _ = _observing_client()
+        context.shutdown = AsyncMock()
+
+        await client.shutdown()
+
+        with pytest.raises(ClientNotInitialisedError):
+            await client.get_device_info()
+        with pytest.raises(ClientNotInitialisedError):
+            await client.get_status()
+        with pytest.raises(ClientNotInitialisedError):
+            await client.set_control_values({"pwr": "1"})
+        with pytest.raises(ClientNotInitialisedError):
+            await anext(client.observe_status())
 
     @pytest.mark.asyncio
     async def test_create_passes_host_and_port(self):
