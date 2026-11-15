@@ -16,7 +16,7 @@ from aiocoap import Context, Message, Unreliable
 from aiocoap.error import NetworkError
 from aiocoap.numbers.codes import GET, POST
 
-from philips_airctrl.coap.encryption import EncryptionContext
+from philips_airctrl.coap.encryption import DigestMismatchError, EncryptionContext
 
 logger = logging.getLogger(__name__)
 
@@ -227,6 +227,24 @@ class Client:
         status = json.loads(payload)
         return cast("dict[str, Any]", status["state"]["reported"])
 
+    def _read_observed_status(self, response: Any, source: str) -> dict[str, Any] | None:
+        """Decrypt an observed status, or return ``None`` if it cannot be read.
+
+        Some firmware occasionally sends a status whose ciphertext is not valid
+        hex (for example NUL bytes inside it) with a digest computed over the
+        corrupted string. Such a status cannot be read, but the observation
+        itself is still healthy, so it is logged and skipped instead of ending
+        the stream. Only successful responses are skipped: an error response
+        carries no encrypted status, so its error still propagates.
+        """
+        try:
+            return self._decrypt_status(response)
+        except (DigestMismatchError, ValueError) as err:
+            if not response.code.is_successful():
+                raise
+            logger.warning("skipping an unreadable %s status: %s", source, err)
+            return None
+
     async def _register_status_observation(self, timeout: float | None = None) -> tuple[Any, Any]:
         """Register an Observe on the status resource and await its first response.
 
@@ -264,7 +282,15 @@ class Client:
         request (a new token) on the same encryption session, without a new
         sync, and the replaced observation is cancelled once the new one has
         answered. A renewal's first status is only yielded when it differs from
-        the last status yielded; device notifications are never suppressed.
+        the last status yielded; device notifications are never suppressed. A
+        successful status response that cannot be decrypted, including the
+        registration response, is logged and skipped, and the observation
+        continues, so the first status yielded is the first readable one and
+        may come from a later notification or renewal. Error responses, a
+        status without ``state.reported``, network errors and timeouts still
+        raise. If every status is unreadable, the stream yields nothing until
+        the observation ends or is renewed; callers that need a liveness
+        guarantee should use their own timeout.
 
         The observation is cancelled whenever the generator exits. A renewal
         that fails raises ``NetworkError``, or ``TimeoutError`` after
@@ -279,12 +305,13 @@ class Client:
         logger.debug("observing status")
         requester, response = await self._register_status_observation()
         try:
-            last_status = self._decrypt_status(response)
+            last_status = self._read_observed_status(response, "registration")
             # Start the renewal clock before yielding, so time the caller spends
             # on the first status does not delay the first renewal.
             deadline = loop.time() + (renew_interval or self._max_age(response))
             notifications = aiter(requester.observation)
-            yield last_status
+            if last_status is not None:
+                yield last_status
             while True:
                 renewal_due = asyncio.timeout_at(deadline)
                 try:
@@ -305,11 +332,13 @@ class Client:
                     requester = new_requester
                     notifications = aiter(requester.observation)
                     deadline = loop.time() + (renew_interval or self._max_age(response))
-                    status = self._decrypt_status(response)
-                    if status == last_status:
+                    status = self._read_observed_status(response, "renewal")
+                    if status is None or status == last_status:
                         continue
                 else:
-                    status = self._decrypt_status(response)
+                    status = self._read_observed_status(response, "notification")
+                    if status is None:
+                        continue
                 last_status = status
                 yield status
         finally:

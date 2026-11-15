@@ -1,16 +1,19 @@
 """Tests for the CoAP client module."""
 
 import asyncio
+import hashlib
 import json
 import logging
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from aiocoap import CONTENT, Message
 from aiocoap.error import NetworkError
 
 from philips_airctrl.coap import client as client_module
 from philips_airctrl.coap.client import Client, ClientNotInitialisedError
+from philips_airctrl.coap.encryption import DigestMismatchError, EncryptionContext
 
 
 class FakeObservation:
@@ -55,15 +58,22 @@ class FakeObservation:
         return item
 
 
-def _response(reported: str, max_age: Any = 60) -> MagicMock:
+def _response(reported: str, max_age: Any = 60, *, successful: bool = True) -> MagicMock:
     """Build a response whose payload "decrypts" to the given reported state."""
     response = MagicMock()
     response.payload.decode.return_value = f'{{"state": {{"reported": {reported}}}}}'
     response.opt.max_age = max_age
+    response.code.is_successful.return_value = successful
     return response
 
 
-def _requester(reported: str | None = None, *, max_age: Any = 60, error: Any = None) -> MagicMock:
+def _requester(
+    reported: str | None = None,
+    *,
+    max_age: Any = 60,
+    error: Any = None,
+    successful: bool = True,
+) -> MagicMock:
     """Build a requester with a FakeObservation and an awaitable first response."""
     requester = MagicMock()
     requester.observation = FakeObservation()
@@ -73,7 +83,7 @@ def _requester(reported: str | None = None, *, max_age: Any = 60, error: Any = N
             raise error
         if reported is None:
             await asyncio.Event().wait()
-        return _response(reported, max_age)
+        return _response(reported, max_age, successful=successful)
 
     requester.response = first_response()
     return requester
@@ -1014,18 +1024,6 @@ class TestObserveStatusRenewal:
         assert "network error while observing status" in caplog.text
 
     @pytest.mark.asyncio
-    async def test_decryption_error_cancels_once(self):
-        client, context, encryption = _observing_client()
-        first = _requester('{"power": true}')
-        context.request.side_effect = [first]
-        encryption.decrypt.side_effect = ValueError("bad padding")
-
-        with pytest.raises(ValueError, match="bad padding"):
-            await anext(client.observe_status())
-
-        first.observation.cancel.assert_called_once_with()
-
-    @pytest.mark.asyncio
     async def test_rejects_a_non_positive_renew_interval(self):
         client, _, _ = _observing_client()
         with pytest.raises(ValueError, match="renew_interval"):
@@ -1060,3 +1058,219 @@ class TestObserveStatusRenewal:
             await anext(stream)
 
         first.observation.cancel.assert_not_called()
+
+
+def _corrupted_push(encryption: EncryptionContext, reported: str) -> str:
+    """Encrypt a status, put two NUL bytes into the ciphertext, re-sign it.
+
+    This mirrors a push captured from an AMF870 (firmware
+    AWS_Philips_AIR_Combo@86): the digest is computed over the corrupted
+    string, so the digest check passes and bytes.fromhex() fails.
+    """
+    payload = encryption.encrypt(f'{{"state": {{"reported": {reported}}}}}')
+    key, ciphertext = payload[:8], payload[8:-64]
+    ciphertext = ciphertext[:40] + "\x00\x00" + ciphertext[42:]
+    digest = hashlib.sha256((key + ciphertext).encode()).hexdigest().upper()
+    return key + ciphertext + digest
+
+
+def _unreadable(marker: str = "corrupted") -> Any:
+    """Identity decrypt that fails like a corrupted push for payloads containing ``marker``."""
+
+    def decrypt(payload: str) -> str:
+        if marker in payload:
+            raise ValueError("non-hexadecimal number found in fromhex() arg at position 40")
+        return payload
+
+    return decrypt
+
+
+class TestObserveStatusUndecryptablePush:
+    """A successful status response that cannot be decrypted is skipped (#44)."""
+
+    def test_corrupted_push_fails_in_decrypt_after_the_digest_check(self):
+        encryption = EncryptionContext()
+        encryption.set_client_key("0000000A")
+        with pytest.raises(ValueError, match="non-hexadecimal number found in fromhex"):
+            encryption.decrypt(_corrupted_push(encryption, '{"power": true}'))
+
+    @pytest.mark.asyncio
+    async def test_unreadable_registration_response_waits_for_the_next_push(self, caplog):
+        # Push-only firmware answers the registration GET with the next push,
+        # so a corrupted push can arrive as the registration response.
+        client, context, encryption = _observing_client()
+        first = _requester('{"power": "corrupted"}')
+        context.request.side_effect = [first]
+        first.observation.push(_response('{"power": false}'))
+        encryption.decrypt.side_effect = _unreadable()
+
+        stream = client.observe_status(renew_interval=60)
+        with caplog.at_level(logging.WARNING, logger="philips_airctrl.coap.client"):
+            assert await anext(stream) == {"power": False}
+        first.observation.cancel.assert_not_called()
+        await stream.aclose()
+
+        assert context.request.call_count == 1
+        first.observation.cancel.assert_called_once_with()
+        (record,) = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert record.getMessage() == (
+            "skipping an unreadable registration status: "
+            "non-hexadecimal number found in fromhex() arg at position 40"
+        )
+        assert "corrupted" not in record.getMessage()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error",
+        [
+            ValueError("non-hexadecimal number found in fromhex() arg at position 40"),
+            DigestMismatchError(),
+            json.JSONDecodeError("Expecting value", "", 0),
+        ],
+    )
+    async def test_unreadable_notification_is_skipped(self, error, caplog):
+        client, context, encryption = _observing_client()
+        first = _requester('{"power": true}')
+        context.request.side_effect = [first]
+        bad = _response('{"power": "corrupted"}')
+        first.observation.push(bad)
+        first.observation.push(_response('{"power": false}'))
+
+        def decrypt(payload: str) -> str:
+            if payload == bad.payload.decode.return_value:
+                raise error
+            return payload
+
+        encryption.decrypt.side_effect = decrypt
+        stream = client.observe_status(renew_interval=60)
+        results = [await anext(stream) for _ in range(2)]
+        first.observation.cancel.assert_not_called()
+        await stream.aclose()
+
+        assert results == [{"power": True}, {"power": False}]
+        assert context.request.call_count == 1
+        assert "skipping an unreadable notification status" in caplog.text
+        first.observation.cancel.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_unreadable_renewal_response_is_skipped(self, caplog):
+        client, context, encryption = _observing_client()
+        first = _requester('{"power": true}')
+        second = _requester('{"power": "corrupted"}')
+        context.request.side_effect = [first, second]
+        second.observation.push(_response('{"power": false}'))
+        encryption.decrypt.side_effect = _unreadable()
+
+        stream = client.observe_status(renew_interval=0.01)
+        results = [await anext(stream) for _ in range(2)]
+        second.observation.cancel.assert_not_called()
+        await stream.aclose()
+
+        assert results == [{"power": True}, {"power": False}]
+        assert "skipping an unreadable renewal status" in caplog.text
+        first.observation.cancel.assert_called_once_with()
+        second.observation.cancel.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_skipped_registration_then_readable_renewal_is_the_first_yield(self):
+        client, context, encryption = _observing_client()
+        first = _requester('{"power": "corrupted"}')
+        second = _requester('{"power": true}')
+        context.request.side_effect = [first, second]
+        encryption.decrypt.side_effect = _unreadable()
+
+        stream = client.observe_status(renew_interval=0.01)
+        assert await anext(stream) == {"power": True}
+        await stream.aclose()
+
+        assert context.request.call_count == 2
+        first.observation.cancel.assert_called_once_with()
+        second.observation.cancel.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_unreadable_registration_then_device_end_yields_nothing(self):
+        client, context, encryption = _observing_client()
+        first = _requester('{"power": "corrupted"}')
+        context.request.side_effect = [first]
+        first.observation.end()
+        encryption.decrypt.side_effect = _unreadable()
+
+        results = [status async for status in client.observe_status(renew_interval=60)]
+
+        assert results == []
+        assert context.request.call_count == 1
+        # The device ended the observation itself; no second cancel.
+        first.observation.cancel.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unreadable_error_response_still_raises(self):
+        client, context, encryption = _observing_client()
+        first = _requester("{}", successful=False)
+        context.request.side_effect = [first]
+        encryption.decrypt.side_effect = DigestMismatchError()
+
+        with pytest.raises(DigestMismatchError):
+            await anext(client.observe_status())
+
+        first.observation.cancel.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_readable_status_without_state_reported_still_raises(self):
+        client, context, _ = _observing_client()
+        response = _response("{}")
+        response.payload.decode.return_value = '{"state": {}}'
+        first = MagicMock()
+        first.observation = FakeObservation()
+
+        async def respond() -> Any:
+            return response
+
+        first.response = respond()
+        context.request.side_effect = [first]
+
+        with pytest.raises(KeyError, match="reported"):
+            await anext(client.observe_status())
+
+        first.observation.cancel.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("corrupted_first", [True, False], ids=["registration", "notification"])
+    async def test_real_corrupted_push_is_skipped_end_to_end(self, corrupted_first):
+        client, context, _ = _observing_client()
+        encryption = EncryptionContext()
+        encryption.set_client_key("0000000A")
+        client._encryption_context = encryption
+
+        def message(payload: str) -> Message:
+            return Message(code=CONTENT, payload=payload.encode())
+
+        def encrypted(reported: str) -> Message:
+            return message(encryption.encrypt(f'{{"state": {{"reported": {reported}}}}}'))
+
+        corrupted = message(_corrupted_push(encryption, '{"power": true}'))
+        if corrupted_first:
+            first_response, pushes = corrupted, [encrypted('{"power": false}')]
+            expected = [{"power": False}]
+        else:
+            first_response = encrypted('{"power": true}')
+            pushes = [corrupted, encrypted('{"power": false}')]
+            expected = [{"power": True}, {"power": False}]
+
+        first = MagicMock()
+        first.observation = FakeObservation()
+
+        async def respond() -> Any:
+            return first_response
+
+        first.response = respond()
+        for push in pushes:
+            first.observation.push(push)
+        context.request.side_effect = [first]
+
+        stream = client.observe_status(renew_interval=60)
+        results = [await anext(stream) for _ in expected]
+        first.observation.cancel.assert_not_called()
+        await stream.aclose()
+
+        assert results == expected
+        first.observation.cancel.assert_called_once_with()

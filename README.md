@@ -143,7 +143,9 @@ async def main():
 
         # Observe real-time updates. The Observe registration is renewed every
         # Max-Age seconds (or renew_interval=...) so the stream stays alive; a
-        # renewal that fails raises NetworkError or TimeoutError.
+        # renewal that fails raises NetworkError or TimeoutError. A status push
+        # that cannot be decrypted is logged and skipped, so the first update
+        # can come from a later push.
         async for update in client.observe_status():
             print(update)
             break
