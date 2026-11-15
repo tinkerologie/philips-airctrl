@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-11-16
+
 ### Fixed
 
 - `CoAPClient.observe_status()` no longer ends when the device pushes a status that cannot be decrypted ([#44](https://github.com/tinkerologie/philips-airctrl/issues/44)). Some firmware (seen on an AMF870 with `AWS_Philips_AIR_Combo@86`) occasionally sends a status with NUL bytes inside the hex ciphertext and a digest computed over the corrupted string, so `bytes.fromhex()` raised `ValueError` and the observation was cancelled. A successful (2.xx) status response that fails with `DigestMismatchError` or `ValueError` is now logged as a warning and skipped, for the registration response, renewal responses and notifications alike. The first status yielded is therefore the first readable one, which can come from a later push. Error responses, a status without `state.reported`, network errors and timeouts still raise, and `get_status()` is unchanged.
