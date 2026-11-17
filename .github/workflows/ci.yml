@@ -16,6 +16,7 @@ concurrency:
 
 jobs:
   lint:
+    timeout-minutes: 30
     name: Lint
     runs-on: ubuntu-latest
     steps:
@@ -39,6 +40,7 @@ jobs:
         run: uv run --frozen --no-sync mypy
 
   test:
+    timeout-minutes: 30
     name: Test (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:

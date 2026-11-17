@@ -9,6 +9,7 @@ permissions:
 
 jobs:
   publish:
+    timeout-minutes: 60
     name: Publish
     runs-on: ubuntu-latest
     environment: release
